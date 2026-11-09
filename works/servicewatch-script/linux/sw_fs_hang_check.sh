@@ -1,14 +1,16 @@
 #!/bin/bash
 # =============================================================================
-# sw_fs_hang_check.sh — 파일시스템(local/NFS) hang 체크 (ServiceWatch 사용자 정의 지표)
+# sw_fs_hang_check.sh — 로컬 파일시스템 hang 체크 (ServiceWatch 사용자 정의 지표)
 # =============================================================================
 #
 # [무엇을 하나]
 #   Cloud Monitoring Agent의 "Filesystem Hang Check" 지표를 ServiceWatch용으로 재현한다.
 #     Cloud Monitoring 정의: FileSystem | Filesystem Hang Check | state | 1m |
 #                            filesystem(local/NFS) hang 체크 (정상:1, 비정상:0)
+#   값의 정의(1/0)는 같게 맞추고, 대상은 로컬 파일시스템(xfs/ext4)만 확인한다.
+#   (NFS는 대상에서 제외 — 마운트 상태는 sw_custom_metrics.sh의 custom_nfs_mount_up으로 본다)
 #
-#   마운트된 xfs/ext4(로컬)와 nfs/nfs4(NFS)마다 "캐시를 거치지 않는 요청"을 한 번 보내고,
+#   마운트된 xfs/ext4 로컬 파일시스템마다 "캐시를 거치지 않는 디스크 I/O"를 한 번 보내고,
 #   WAIT_SEC 안에 성공으로 끝나는지 확인한다. 결과는 node_exporter textfile collector
 #   형식으로 출력한다.
 #
@@ -18,18 +20,19 @@
 #     0 = 비정상 : 아래 중 하나
 #                  - WAIT_SEC 안에 끝나지 않음 (hang)
 #                  - 이전 실행에서 띄운 확인이 아직도 멈춰 있음 (hang 지속)
-#                  - 요청이 에러로 끝남 (read-only 전환, 공간 부족, NFS 서버 오류 등)
+#                  - I/O가 에러로 끝남 (read-only 전환, 공간 부족, 권한 등)
 #
 #   → 알람 조건: "값 < 1" (= 0) 을 N회 연속 위반 시  (일시 오탐 완화, 아래 [운영 시 알아둘 점])
 #
-# [왜 ls/stat/df가 아니라 이 방법인가]
-#   - 로컬(xfs/ext4): ls/stat/df(statfs)는 커널 메모리 캐시에서 응답하므로 디스크 I/O가
-#     멈춰도 정상 응답한다. node_exporter의 node_filesystem_device_error도 0으로 남는다.
-#     (테스트: dmsetup suspend로 I/O를 멈춘 상태에서 모두 정상 응답 확인)
-#     → 4KB 동기 쓰기(write 모드) 또는 장치 직접 읽기(read 모드)로 디스크까지 닿게 한다.
-#   - NFS: statfs(stat -f)는 캐시 없이 매번 NFS 서버에 FSSTAT 요청을 보낸다
-#     (NFS 서버가 멈추면 df가 멈추는 것과 같은 원리). 쓰기 권한이 없는 export(ro)에서도
-#     쓸 수 있고 서버에 파일을 만들지 않으므로 NFS는 항상 statfs로 확인한다.
+# [왜 ls/stat/df가 아니라 실제 I/O인가]
+#   로컬 파일시스템의 ls/stat/df(statfs)는 커널 메모리 캐시에서 응답하므로 디스크 I/O가
+#   멈춰도 정상 응답한다. node_exporter의 node_filesystem_device_error도 0으로 남는다.
+#   (테스트: dmsetup suspend로 I/O를 멈춘 상태에서 모두 정상 응답 확인)
+#     - df(statfs) : 여유 블록 수를 메모리 카운터에서 바로 계산 → 디스크를 아예 안 읽음
+#     - stat / ls  : inode·dentry 캐시에 있으면 디스크를 안 읽음. 만료 시간 없이
+#                    메모리 압박으로 밀려날 때까지 유지 (자주 보는 경로는 사실상 계속 캐시)
+#     - 일반 write : 페이지 캐시에 쓰고 바로 성공 반환. 디스크 기록은 나중에 flusher가 함
+#   → 4KB 동기 쓰기(write 모드) 또는 장치 직접 읽기(read 모드)로 디스크까지 닿게 한다.
 #
 # [운영 시스템에 영향을 주지 않기 위한 설계]
 #   1) 확인(probe)은 백그라운드로 띄우고 기다리지 않는다.
@@ -55,23 +58,19 @@
 #     문제가 되면 PROBE_MODE="read" 또는 INCLUDED_MOUNTPOINTS로 대상을 좁힌다.
 #   - write 모드의 동기 쓰기(dsync)는 저널 커밋을 1회 유발한다 (fsync 1회 수준).
 #   - write 모드는 fsfreeze(백업 스냅샷) 중 0이 나올 수 있다 → 알람은 "N회 연속 위반"으로.
-#   - NFS는 /proc/self/mountinfo에 "현재 마운트된 것"만 확인한다.
-#     fstab에는 있는데 마운트가 빠진 NFS는 이 지표에 나오지 않는다
-#     → sw_custom_metrics.sh의 custom_nfs_mount_up으로 따로 본다.
-#   - soft 마운트 NFS는 서버 무응답 시 timeo×retrans 후 에러로 끝나고,
-#     hard 마운트는 응답이 올 때까지 멈춘다. 어느 쪽이든 결과는 0(비정상).
+#   - NFS 등 네트워크 파일시스템은 확인하지 않는다 (ALLOWED_FSTYPES에 넣지 말 것 —
+#     NFS는 장치 경로가 없어 read 모드가 동작하지 않고, write 모드는 공유 스토리지에 파일을 만든다)
 #   - 재부팅 직후 첫 실행 전에는 /run이 비어 있어 node_textfile_scrape_error=1이 된다
 #     (최대 1분). 같은 디렉터리의 다른 .prom 파일은 영향 없음 (확인함).
 #   - 값의 의미가 이전 버전(0 정상/1 hang/2 실패)과 반대다.
 #     이전 버전 기준으로 만든 알람("0이 아니면")이 있으면 "1 미만이면"으로 바꿔야 한다.
 #
 # [모드별 결과]
-#                            로컬 write(기본)  로컬 read   NFS(statfs, 모드 무관)
-#   디스크/스토리지 멈춤           0              0             -
-#   NFS 서버 무응답                -              -             0
-#   fsfreeze                       0              1             -
-#   read-only 전환                 0              1             1
-#   파일 생성                  있음(즉시 삭제)    없음          없음
+#                            write(기본)       read
+#   디스크/스토리지 멈춤           0              0
+#   fsfreeze                       0              1
+#   read-only 전환                 0              1
+#   파일 생성                  있음(즉시 삭제)    없음
 #
 # [설치]
 #   1) TEXTFILE_DIR을 node_exporter --collector.textfile.directory 값으로 설정
@@ -83,7 +82,7 @@
 # [검증 환경] Rocky Linux 9.7 (SELinux Enforcing), node_exporter 1.8.2,
 #   loop 장치 위 xfs/ext4 + dmsetup suspend --nolockfs(실제 I/O 멈춤)·fsfreeze·
 #   read-only remount·동시 실행·PID 재사용·env -i(cron 환경) 시나리오.
-#   실제 디스크 고장, NFS, 권한이 제한된(SELinux confined) node_exporter는 미검증.
+#   실제 디스크 고장, 권한이 제한된(SELinux confined) node_exporter는 미검증.
 # =============================================================================
 
 # 숫자/문자 처리를 로케일과 무관하게 고정하고, cron의 최소 PATH에서도 명령을 찾도록 지정
@@ -93,10 +92,10 @@ PATH=/usr/sbin:/usr/bin:/sbin:/bin
 # ----------------------------------------------------------------------------- 설정
 TEXTFILE_DIR=""                         # node_exporter --collector.textfile.directory 값 (필수)
 OUT_NAME="sw_fs_hang.prom"              # 출력 파일명 (textfile collector는 *.prom만 읽음)
-ALLOWED_FSTYPES="xfs|ext4|nfs|nfs4"     # 확인할 파일시스템 종류 (정규식). NFS를 빼려면 "xfs|ext4"
+ALLOWED_FSTYPES="xfs|ext4"              # 확인할 로컬 파일시스템 종류 (정규식). 네트워크 FS(nfs 등)는 넣지 않는다
 EXCLUDED_MOUNTPOINTS="^(/boot/efi|/boot)$"   # 제외할 마운트포인트 (정규식)
 INCLUDED_MOUNTPOINTS=""                 # 비우면 전체. 지정하면 이 정규식에 맞는 것만 (예: "^(/|/data)$")
-PROBE_MODE="write"                      # 로컬 FS 확인 방식 (NFS는 항상 statfs)
+PROBE_MODE="write"                      # 확인 방식
                                         #   write: 4KB 동기 쓰기 후 삭제
                                         #   read : 장치에서 4KB 직접 읽기 (파일 생성 없음)
 PROBE_FILE=".sw_hangcheck"              # write 모드에서 마운트 최상위에 잠깐 만드는 파일명
@@ -143,23 +142,20 @@ probe_alive() {
 	[[ -n "$pid" && -n "$st" && "$(proc_start "$pid")" == "$st" ]]
 }
 
-# probe를 백그라운드로 띄운다. ($1 = 장치 key, $2 = 마운트포인트, $3 = 장치, $4 = fstype)
+# probe를 백그라운드로 띄운다. ($1 = 장치 key, $2 = 마운트포인트, $3 = 장치 경로)
 # probe가 끝나면 종료 코드를 <key>.rc 파일에 남긴다 (tmp에 쓰고 mv → 반쯤 쓰인 파일 방지).
 # 메인 스크립트는 wait하지 않고 이 rc 파일이 생겼는지만 본다.
 #   - </dev/null >/dev/null 2>&1 : 표준 입출력을 끊어 스크립트 출력/파이프를 붙잡지 않게 함
 #   - 9>&-                        : lock fd를 넘기지 않음 (위 "중복 실행 방지" 참고)
 #   - ( ... ) &                   : 서브셸을 백그라운드로 실행. 멈추면 이 서브셸이 D 상태로 남는다
 start_probe() {
-	local key="$1" mp="$2" src="$3" fstype="$4" rc="$STATE_DIR/$1.rc"
+	local key="$1" mp="$2" src="$3" rc="$STATE_DIR/$1.rc"
 	rm -f "$rc"                                 # 이전 결과 제거 → rc 파일 존재 = 이번 probe 완료
-	if [[ "$fstype" == nfs* ]]; then
-		# NFS: statfs를 서버에 직접 요청 (캐시 없음, 쓰기 권한 불필요, 서버에 파일 생성 없음)
-		( stat -f "$mp"; echo $? > "$rc.tmp" && mv -f "$rc.tmp" "$rc" ) </dev/null >/dev/null 2>&1 9>&- &
-	elif [[ "$PROBE_MODE" == "read" ]]; then
-		# 로컬 read: 장치 맨 앞 4KB를 페이지 캐시를 거치지 않고(iflag=direct) 읽는다. 파일 생성 없음.
+	if [[ "$PROBE_MODE" == "read" ]]; then
+		# read: 장치 맨 앞 4KB를 페이지 캐시를 거치지 않고(iflag=direct) 읽는다. 파일 생성 없음.
 		( dd if="$src" of=/dev/null bs=4k count=1 iflag=direct; echo $? > "$rc.tmp" && mv -f "$rc.tmp" "$rc" ) </dev/null >/dev/null 2>&1 9>&- &
 	else
-		# 로컬 write: 4KB를 디스크까지 동기 쓰기(oflag=dsync)한 뒤 바로 삭제한다.
+		# write: 4KB를 디스크까지 동기 쓰기(oflag=dsync)한 뒤 바로 삭제한다.
 		#   쓰기 실패(read-only, 공간 부족)면 dd가 0이 아닌 코드로 끝나 → 비정상(0)
 		#   "&&" 이므로 dd가 실패하면 rm은 실행하지 않고 dd의 종료 코드가 rc에 남는다
 		( dd if=/dev/zero of="$mp/$PROBE_FILE" bs=4k count=1 oflag=dsync && rm -f "$mp/$PROBE_FILE"
@@ -173,13 +169,12 @@ start_probe() {
 # /proc/self/mountinfo 형식:
 #   마운트ID 부모ID 주번호:부번호 root 마운트포인트 옵션 [선택필드...] - fstype 장치 슈퍼옵션
 #   예) 98 1 253:2 / /data rw,relatime shared:50 - xfs /dev/mapper/vg-data rw,attr2
-#   예) 120 1 0:53 / /mnt/nas rw,relatime shared:60 - nfs4 nas01:/export rw,vers=4.2
 # 선정 규칙:
+#   - fstype이 ALLOWED_FSTYPES에 맞는 것만 → 로컬 xfs/ext4 (nfs, tmpfs, overlay 등 제외)
 #   - root($4)가 "/"인 것만 → bind mount(파일시스템의 하위 디렉터리를 다시 마운트한 것) 제외
 #   - 같은 장치(주:부번호)는 처음 1개만 → 같은 디스크를 중복 확인하지 않음
-#     (NFS는 마운트마다 0:xx 형태의 가상 번호가 따로 붙으므로 마운트별로 확인됨)
 #   - 공백 등이 들어간 경로는 \040처럼 이스케이프되어 지표 레이블이 깨지므로 제외
-# 여기서는 mountinfo(메모리 정보)만 읽으므로 디스크나 NFS가 멈춰도 이 단계는 멈추지 않는다.
+# 여기서는 mountinfo(커널 메모리 정보)만 읽으므로 디스크가 멈춰도 이 단계는 멈추지 않는다.
 keys=(); mps=(); fstypes=(); waitkeys=()
 while read -r majmin mp fstype src; do
 	[[ "$mp" == *\\* ]] && continue
@@ -188,7 +183,7 @@ while read -r majmin mp fstype src; do
 	key=${majmin/:/_}                       # 예: 253:0 → 253_0 (state 파일 이름으로 사용)
 	keys+=("$key"); mps+=("$mp"); fstypes+=("$fstype")
 	if ! probe_alive "$key"; then           # 이전 probe가 아직 멈춰 있으면 새로 띄우지 않음(→ 바로 0)
-		start_probe "$key" "$mp" "$src" "$fstype"
+		start_probe "$key" "$mp" "$src"
 		waitkeys+=("$key")                  # 이번에 새로 띄운 것만 결과를 기다린다
 	fi
 done < <(awk -v re="^(${ALLOWED_FSTYPES})$" '{
