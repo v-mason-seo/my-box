@@ -139,8 +139,36 @@ fi
 # awk는 ALLOWED_FSTYPES만 골라 "주:부 마운트포인트 fstype 장치 root" 로 넘긴다. 나머지 거르기는 while에서.
 step "3/7 대상 선정 (/proc/self/mountinfo, fstype=$ALLOWED_FSTYPES)"
 declare -A seen_dev seen_mp
-mps=(); fstypes=(); devs=(); keys=()
+mps=(); fstypes=(); devs=(); keys=(); disks=()
 n_skip=0
+
+# 주:부번호 → "커널 장치명 -> 실제 디스크" (예: dm-0 -> sda, sda2 -> sda). sysfs만 보므로 디스크 I/O 없음
+phys_disks() {   # $1 커널 장치명 → 맨 아래 디스크 이름들 (LVM/RAID면 slaves를 따라 내려감)
+	local k=$1 s found=""
+	for s in /sys/class/block/"$k"/slaves/*; do
+		[[ -e "$s" ]] || continue
+		found=1
+		phys_disks "${s##*/}"
+	done
+	[[ -n "$found" ]] && return
+	if [[ -f "/sys/class/block/$k/partition" ]]; then   # 파티션 → 상위 디스크
+		s=$(readlink -f "/sys/class/block/$k/..")
+		echo "${s##*/}"
+	else
+		echo "$k"
+	fi
+}
+disk_chain() {
+	local k d bf
+	k=$(readlink -f "/sys/dev/block/$1" 2>/dev/null); k=${k##*/}
+	[[ -n "$k" ]] || { echo "?"; return; }
+	d=$(phys_disks "$k" | sort -u | paste -sd, -)
+	bf=""
+	[[ -r "/sys/class/block/$d/loop/backing_file" ]] && read -r bf < "/sys/class/block/$d/loop/backing_file"
+	if [[ "$d" == "$k" ]]; then echo "$k${bf:+ (파일 $bf)}"
+	else                        echo "$k -> $d${bf:+ (파일 $bf)}"
+	fi
+}
 while read -r majmin mp fstype src root; do
 	reason=""
 	if   [[ "$root" != "/" ]];                                                  then reason="bind mount (root=$root)"
@@ -151,7 +179,7 @@ while read -r majmin mp fstype src root; do
 	elif [[ -n "${seen_mp[$mp]}" ]];                                            then reason="같은 경로에 겹쳐 마운트됨"
 	fi
 	if [[ -n "$reason" ]]; then
-		item "$(printf '[제외] %-20s %-5s %-8s %s' "$mp" "$fstype" "$majmin" "$reason")"
+		item "$(printf '[제외] %-20s %-5s %-8s %-26s %s' "$mp" "$fstype" "$majmin" "$src" "$reason")"
 		(( n_skip++ ))
 		continue
 	fi
@@ -161,8 +189,9 @@ while read -r majmin mp fstype src root; do
 	dev=$src                                            # /dev/root 처럼 없는 이름일 수 있어
 	[[ -b "/dev/block/$majmin" ]] && dev="/dev/block/$majmin"   # udev 링크를 우선 사용
 
-	mps+=("$mp"); fstypes+=("$fstype"); devs+=("$dev"); keys+=("${majmin/:/_}")
-	item "$(printf '[대상] %-20s %-5s %-8s %s' "$mp" "$fstype" "$majmin" "$dev")"
+	disk=$(disk_chain "$majmin")
+	mps+=("$mp"); fstypes+=("$fstype"); devs+=("$dev"); keys+=("${majmin/:/_}"); disks+=("$disk")
+	item "$(printf '[대상] %-20s %-5s %-8s %-26s 디스크: %s' "$mp" "$fstype" "$majmin" "$src" "$disk")"
 done < <(awk -v re="^(${ALLOWED_FSTYPES})$" '{
 		for (i = 7; i <= NF; i++) if ($i == "-") break
 		if ($(i+1) ~ re) print $3, $5, $(i+1), $(i+2), $4
@@ -195,7 +224,7 @@ for i in "${!keys[@]}"; do
 		) </dev/null >/dev/null 2>&1 8>&- 9>&- &        # 로그·lock fd를 넘기지 않음
 		states+=("probe")
 		(( n_probe++ ))
-		item "$(printf '[START] %-20s dd if=%s' "${mps[$i]}" "$dev")"
+		item "$(printf '[START] %-20s dd if=%s  (%s)' "${mps[$i]}" "$dev" "${disks[$i]%% (*}")"
 	fi
 done
 step_end "새로 시작 ${n_probe}개 / 이전 멈춤 ${n_stuck}개"
@@ -257,7 +286,7 @@ for i in "${!keys[@]}"; do
 		fi
 	fi
 	if (( status == STATUS_OK )); then tag="[OK]"; (( n_ok++ )); else tag="[NG]"; (( n_ng++ )); fi
-	item "$(printf '%s %-20s = %s  %-8s  %s' "$tag" "${mps[$i]}" "$status" "$kind" "$why")"
+	item "$(printf '%s %-20s %-14s = %s  %-8s  %s' "$tag" "${mps[$i]}" "${disks[$i]%% (*}" "$status" "$kind" "$why")"
 	lines+=("custom_fs_hang_status{mountpoint=\"${mps[$i]}\",fstype=\"${fstypes[$i]}\"} ${status}")
 done
 { for l in "${lines[@]}"; do echo "$l"; done; } > "$RESULT_FILE.tmp" &&
