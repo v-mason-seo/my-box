@@ -43,18 +43,26 @@ LOG_FILE=${LOG_FILE:-$PWD/${SCRIPT_NAME%.sh}.log}
 exec 8>>"$LOG_FILE" || { echo "$SCRIPT_NAME: cannot open log file $LOG_FILE" >&2; exit 1; }
 cd / || exit 1                                         # 백그라운드 dd가 실행 위치를 붙잡지 않게
 
-RUN_T0=${EPOCHREALTIME/./}
+# 현재 시각(마이크로초) → NOW_US. bash 5.0+는 $EPOCHREALTIME, 4.x(RHEL/CentOS 7 등)는 date로 구한다
+if [[ -n "$EPOCHREALTIME" ]]; then
+	now_us() { NOW_US=${EPOCHREALTIME/./}; }
+else
+	now_us() { NOW_US=$(date +%s%6N); }
+fi
+
+now_us; RUN_T0=$NOW_US
 
 ts() {      # 현재 시각 HH:MM:SS.mmm
-	local us=${EPOCHREALTIME/./}
-	printf '%(%H:%M:%S)T.%03d' "${us:0:${#us}-6}" "$(( 10#${us:${#us}-6} / 1000 ))"
+	now_us
+	printf '%(%H:%M:%S)T.%03d' "$(( NOW_US / 1000000 ))" "$(( NOW_US % 1000000 / 1000 ))"
 }
 since() {   # $1(마이크로초)부터 지난 시간 → 12ms / 1.23s
-	local ms=$(( (${EPOCHREALTIME/./} - $1) / 1000 ))
+	now_us
+	local ms=$(( (NOW_US - $1) / 1000 ))
 	if (( ms < 1000 )); then echo "${ms}ms"; else printf '%d.%02ds' $(( ms / 1000 )) $(( ms % 1000 / 10 )); fi
 }
 log()      { printf '%s\n' "$*" >&8; }
-step()     { STEP_T0=${EPOCHREALTIME/./}; log "[$(ts)] STEP $*"; }
+step()     { now_us; STEP_T0=$NOW_US; log "[$(ts)] STEP $*"; }
 item()     { log "    $*"; }
 step_end() { log "  => $*  ($(since "$STEP_T0"))"; log ""; }
 end_run() { # $1 종료 코드, $2 요약
